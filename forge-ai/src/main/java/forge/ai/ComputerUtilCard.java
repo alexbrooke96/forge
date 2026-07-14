@@ -766,7 +766,30 @@ public class ComputerUtilCard {
      * @return a int.
      */
     public static int evaluateCreature(final Card c) {
-        return creatureEvaluator.evaluateCreature(c);
+        if (c == null) {
+            return 0;
+        }
+        // Memoized per card object. The guard fields cover every piece of mutable card state the
+        // evaluator reads that can change without bumping the game timestamp (counters, damage,
+        // tap state, face flips, temporary P/T); everything else it reads only changes together
+        // with the game timestamp or a phase change, which clear this cache wholesale.
+        final Map<Card, int[]> cache = AiCache.getCreatureEvalCache();
+        final int state = c.getCurrentStateName().ordinal();
+        final int power = c.getNetCombatDamage();
+        final int toughness = c.getNetToughness();
+        final int damage = c.getDamage();
+        final int counters = c.getCounters().hashCode();
+        final int tapped = c.isTapped() ? 1 : 0;
+        final int energy = c.getController() == null ? 0 : c.getController().getCounters(CounterEnumType.ENERGY);
+        final int[] cached = cache.get(c);
+        if (cached != null && cached[0] == state && cached[1] == power
+                && cached[2] == toughness && cached[3] == damage
+                && cached[4] == counters && cached[5] == tapped && cached[6] == energy) {
+            return cached[7];
+        }
+        final int value = creatureEvaluator.evaluateCreature(c);
+        cache.put(c, new int[] { state, power, toughness, damage, counters, tapped, energy, value });
+        return value;
     }
     public static int evaluateCreature(final Card c, final boolean considerPT, final boolean considerCMC) {
         return creatureEvaluator.evaluateCreature(c, considerPT, considerCMC);
@@ -803,7 +826,7 @@ public class ComputerUtilCard {
     }
 
     public static int evaluateCreatureList(final CardCollectionView list) {
-        return Aggregates.sum(list, creatureEvaluator);
+        return Aggregates.sum(list, ComputerUtilCard::evaluateCreature);
     }
 
     public static Map<String, Integer> evaluateCreatureListByName(final CardCollectionView list) {
@@ -825,10 +848,14 @@ public class ComputerUtilCard {
      * @return creature will be attack
      */
     public static boolean doesSpecifiedCreatureAttackAI(final Player ai, final Card card) {
-        AiAttackController aiAtk = new AiAttackController(ai, card);
-        Combat combat = new Combat(ai);
-        aiAtk.declareAttackers(combat);
-        return combat.isAttacking(card);
+        return AiCache.getCached("doesSpecifiedCreatureAttackAI",
+                () -> {
+                    AiAttackController aiAtk = new AiAttackController(ai, card);
+                    Combat combat = new Combat(ai);
+                    aiAtk.declareAttackers(combat);
+                    return combat.isAttacking(card);
+                },
+                List.of(AiCache::identity, AiCache::identity), ai, card);
     }
 
     /**
@@ -1228,15 +1255,21 @@ public class ComputerUtilCard {
 
         //interrupt 1: Check whether a possible blocker will be killed for the AI to make a bigger attack
         if (ph.is(PhaseType.MAIN1) && ph.isPlayerTurn(ai) && c.isCreature()) {
-            AiAttackController aiAtk = new AiAttackController(ai);
-            final Combat combat = new Combat(ai);
-            aiAtk.removeBlocker(c);
-            aiAtk.declareAttackers(combat);
-            if (!combat.getAttackers().isEmpty()) {
-                AiAttackController aiAtk2 = new AiAttackController(ai);
-                final Combat combat2 = new Combat(ai);
-                aiAtk2.declareAttackers(combat2);
-                if (combat.getAttackers().size() > combat2.getAttackers().size()) {
+            // every removal-type ability the AI considers asks this about the same candidates,
+            // so the hypothetical attack is memoized per blocker and the baseline reuses the
+            // prediction already cached on the AiController
+            final int attackersWithoutBlocker = AiCache.getCached("attackersWithoutBlocker",
+                    () -> {
+                        AiAttackController aiAtk = new AiAttackController(ai);
+                        final Combat combat = new Combat(ai);
+                        aiAtk.removeBlocker(c);
+                        aiAtk.declareAttackers(combat);
+                        return combat.getAttackers().size();
+                    },
+                    List.of(AiCache::identity, AiCache::identity), ai, c);
+            if (attackersWithoutBlocker > 0) {
+                AiController aic = ((PlayerControllerAi) ai.getController()).getAi();
+                if (attackersWithoutBlocker > aic.getPredictedCombat().getAttackers().size()) {
                     return true;
                 }
             }

@@ -44,6 +44,7 @@ import forge.game.combat.CombatUtil;
 import forge.game.cost.*;
 import forge.game.keyword.Keyword;
 import forge.game.mana.ManaCostBeingPaid;
+import forge.game.phase.PhaseHandler;
 import forge.game.phase.PhaseType;
 import forge.game.player.Player;
 import forge.game.player.PlayerActionConfirmMode;
@@ -99,6 +100,10 @@ public class AiController {
     private boolean useLivingEnd;
     private List<SpellAbility> skipped;
     private volatile boolean timeoutReached;
+    private int lastPredictionFingerprint;
+    private boolean hasPredictionFingerprint = false;
+    private long lastEvalGameTimestamp;
+    private int lastEvalTurnPhase;
 
     public AiController(final Player computerPlayer, final Game game0) {
         player = computerPlayer;
@@ -133,6 +138,49 @@ public class AiController {
 
     public AiCardMemory getCardMemory() {
         return memory;
+    }
+
+    /**
+     * Hash of the game state the cached predictions depend on: board contents and card states,
+     * life totals, hand sizes and phase. Deliberately excludes the stack and the tapped state of
+     * non-creatures, so that opponents paying for and stacking activations doesn't invalidate it.
+     */
+    /**
+     * Folds one value into a running hash so that field order matters, exactly like
+     * {@link java.util.Objects#hash} / {@code String.hashCode} do internally.
+     * The multiplier has no game meaning.
+     */
+    private static int fold(int hash, int value) {
+        return 31 * hash + value;
+    }
+
+    private int computePredictionFingerprint() {
+        final PhaseHandler ph = game.getPhaseHandler();
+        int h = ph.getTurn();
+        h = fold(h, ph.getPhase().ordinal());
+        h = fold(h, (int) game.getTimestamp());
+        h = fold(h, game.getPlayers().indexOf(ph.getPlayerTurn()));
+        if (game.getCombat() != null) {
+            for (final Card c : game.getCombat().getAttackers()) {
+                h = fold(h, c.getId());
+            }
+        }
+        for (final Player p : game.getPlayers()) {
+            h = fold(h, p.getLife());
+            h = fold(h, p.getCardsIn(ZoneType.Hand).size());
+            for (final Card c : p.getCardsIn(ZoneType.Battlefield)) {
+                h = fold(h, c.getId());
+                h = fold(h, (int) c.getGameTimestamp());
+                h = fold(h, c.getDamage());
+                h = fold(h, c.getCounters().hashCode());
+                if (c.isCreature()) {
+                    h = fold(h, c.getNetPower());
+                    h = fold(h, c.getNetToughness());
+                    h = fold(h, c.isTapped() ? 1 : 0);
+                }
+            }
+        }
+        return h;
     }
 
     public Combat getPredictedCombat() {
@@ -1346,12 +1394,34 @@ public class AiController {
     }
 
     public List<SpellAbility> chooseSpellAbilityToPlay() {
-        AiCache.clear();
-        // Reset cached predicted combat, as it may be stale. It will be
-        // re-created if needed and used for any AI logic that needs it.
-        predictedCombat = null;
-        // Also reset predicted combat for next turn here
-        predictedCombatNextTurn = null;
+        // The cached predictions (combat forecasts, board evaluation, life-in-danger) read the
+        // board, not the stack, so they stay valid between consecutive priority passes as long as
+        // the board doesn't change - e.g. while responding to several stack activations in a row.
+        // Only throw them away when the observable state fingerprint changes.
+        final int stateFingerprint = computePredictionFingerprint();
+        if (!hasPredictionFingerprint || stateFingerprint != lastPredictionFingerprint) {
+            // per-card creature evals carry their own guard fields for counter/damage/tap/P-T
+            // changes, so they survive most board changes (e.g. a trigger storm putting counters
+            // on creatures one resolution at a time) and only need to go when cards change zones
+            // or continuous effects (re)apply (game timestamp) or until-EOT effects can expire
+            // (turn/phase change)
+            final long gameTimestamp = game.getTimestamp();
+            final int turnPhase = Objects.hash(game.getPhaseHandler().getTurn(), game.getPhaseHandler().getPhase());
+            if (!hasPredictionFingerprint || gameTimestamp != lastEvalGameTimestamp || turnPhase != lastEvalTurnPhase) {
+                AiCache.clearCreatureEvals();
+                lastEvalGameTimestamp = gameTimestamp;
+                lastEvalTurnPhase = turnPhase;
+            }
+
+            AiCache.clear();
+            // Reset cached predicted combat, as it may be stale. It will be
+            // re-created if needed and used for any AI logic that needs it.
+            predictedCombat = null;
+            // Also reset predicted combat for next turn here
+            predictedCombatNextTurn = null;
+            lastPredictionFingerprint = stateFingerprint;
+            hasPredictionFingerprint = true;
+        }
 
         // Reset priority mana reservation that's meant to work for one spell only
         memory.clearMemorySet(AiCardMemory.MemorySet.HELD_MANA_SOURCES_FOR_NEXT_SPELL);
