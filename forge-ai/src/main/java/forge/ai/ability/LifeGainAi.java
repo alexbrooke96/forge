@@ -165,8 +165,11 @@ public class LifeGainAi extends SpellAbilityAi {
         }
 
         if (sa.getPayCosts() != null && sa.getPayCosts().hasSpecificCostType(CostSacrifice.class)) {
-            // sac costs should be performed at Instant speed when able
-            return new AiAbilityDecision(100, AiPlayDecision.WillPlay);
+            // sac costs should be performed at Instant speed when able, but don't grind away
+            // permanents (e.g. lands) for life gain that's marginal at the current life total
+            if (activateForCost || lifeAmount * 4 >= life) {
+                return new AiAbilityDecision(100, AiPlayDecision.WillPlay);
+            }
         }
 
         // Save instant-speed life-gain unless it is really worth it

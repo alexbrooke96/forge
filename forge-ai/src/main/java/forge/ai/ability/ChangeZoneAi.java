@@ -22,6 +22,7 @@ import forge.game.phase.PhaseType;
 import forge.game.player.Player;
 import forge.game.player.PlayerActionConfirmMode;
 import forge.game.spellability.AbilitySub;
+import forge.game.spellability.AlternativeCost;
 import forge.game.spellability.SpellAbility;
 import forge.game.spellability.TargetRestrictions;
 import forge.game.staticability.StaticAbilityMustTarget;
@@ -651,6 +652,29 @@ public class ChangeZoneAi extends SpellAbilityAi {
         final ZoneType destination = ZoneType.smartValueOf(sa.getParam("Destination"));
 
         if (sa.usesTargeting()) {
+            // if an overloaded version of this spell is affordable and worth casting, hold the
+            // single-target mode so the spell isn't wasted on one permanent (e.g. Cyclonic Rift)
+            if (sa.isSpell() && !sa.isAlternativeCost(AlternativeCost.Overload) && origin.contains(ZoneType.Battlefield)) {
+                for (final SpellAbility overload : sa.getHostCard().getSpellAbilities()) {
+                    if (!overload.isAlternativeCost(AlternativeCost.Overload) || overload.getApi() != sa.getApi()) {
+                        continue;
+                    }
+                    if (overload.getActivatingPlayer() == null) {
+                        overload.setActivatingPlayer(ai);
+                    }
+                    if (!ComputerUtilMana.canPayManaCost(overload, ai, 0, false)) {
+                        continue;
+                    }
+                    final List<Card> affected = overload.knownDetermineDefined(overload.getParam("Defined"));
+                    if (affected == null || affected.isEmpty()) {
+                        continue;
+                    }
+                    final AiAbilityDecision overloadDecision = canPlayOverloadedMassChange(ai, overload, affected, destination);
+                    if (overloadDecision.willingToPlay() || overloadDecision.decision() == AiPlayDecision.TimingRestrictions) {
+                        return new AiAbilityDecision(0, AiPlayDecision.AnotherTime);
+                    }
+                }
+            }
             if (!isPreferredTarget(ai, sa, false, false)) {
                 return new AiAbilityDecision(0, AiPlayDecision.TargetingFailed);
             }
@@ -669,6 +693,12 @@ public class ChangeZoneAi extends SpellAbilityAi {
             // in general this should only be used to protect from Imminent Harm
             // (dying or losing control of)
             if (origin.contains(ZoneType.Battlefield)) {
+                // Overload changes "target" to "each", so an overloaded spell (e.g. Cyclonic Rift)
+                // is a mass board reset, not a self-save like Blinking Spirit
+                if (sa.isAlternativeCost(AlternativeCost.Overload)) {
+                    return canPlayOverloadedMassChange(ai, sa, retrieval, destination);
+                }
+
                 if (ai.getGame().getStack().isEmpty()) {
                     return new AiAbilityDecision(0, AiPlayDecision.CantPlayAi);
                 }
@@ -731,6 +761,56 @@ public class ChangeZoneAi extends SpellAbilityAi {
         }
 
         return new AiAbilityDecision(100, AiPlayDecision.WillPlay);
+    }
+
+    private static AiAbilityDecision canPlayOverloadedMassChange(final Player ai, final SpellAbility sa, final List<Card> affected, final ZoneType destination) {
+        final Game game = ai.getGame();
+        final PhaseHandler ph = game.getPhaseHandler();
+
+        final CardCollection oppCards = CardLists.filterControlledBy(new CardCollection(affected), ai.getOpponents());
+        final CardCollection ownCards = CardLists.filterControlledBy(new CardCollection(affected), ai);
+
+        final boolean toHand = destination.equals(ZoneType.Hand);
+        int oppValue, ownValue, threshold;
+        if (CardLists.getNotType(oppCards, "Creature").isEmpty() && CardLists.getNotType(ownCards, "Creature").isEmpty()) {
+            oppValue = ComputerUtilCard.evaluateCreatureList(oppCards);
+            ownValue = ComputerUtilCard.evaluateCreatureList(ownCards);
+            threshold = AiProfileUtil.getIntProperty(ai, toHand ? AiProps.BOUNCE_ALL_TO_HAND_CREAT_EVAL_DIFF
+                    : AiProps.BOUNCE_ALL_ELSEWHERE_CREAT_EVAL_DIFF);
+        } else {
+            oppValue = ComputerUtilCard.evaluatePermanentList(oppCards);
+            ownValue = ComputerUtilCard.evaluatePermanentList(ownCards);
+            threshold = AiProfileUtil.getIntProperty(ai, toHand ? AiProps.BOUNCE_ALL_TO_HAND_NONCREAT_EVAL_DIFF
+                    : AiProps.BOUNCE_ALL_ELSEWHERE_NONCREAT_EVAL_DIFF);
+            // don't pay a big overload cost to answer less than its mana worth of permanents
+            threshold = Math.max(threshold, sa.getPayCosts().getTotalMana().getCMC());
+        }
+
+        // emergency use: clear the board when about to die in combat, even for less value
+        if (game.getCombat() != null && ph.is(PhaseType.COMBAT_DECLARE_BLOCKERS)
+                && game.getCombat().getDefenders().contains(ai)
+                && ComputerUtilCombat.lifeInSeriousDanger(ai, game.getCombat())
+                && oppValue > ownValue) {
+            return new AiAbilityDecision(100, AiPlayDecision.WillPlay);
+        }
+
+        if (oppValue < ownValue + threshold) {
+            return new AiAbilityDecision(0, AiPlayDecision.CantPlayAi);
+        }
+
+        // worth it: fire before our own combat so the tempo is spent attacking into an empty board,
+        // or at the end of the opponent's turn so they can't rebuild before we untap
+        if (ph.isPlayerTurn(ai) && ph.getPhase().isBefore(PhaseType.COMBAT_DECLARE_ATTACKERS)
+                && !ai.getCreaturesInPlay().isEmpty()) {
+            return new AiAbilityDecision(100, AiPlayDecision.WillPlay);
+        }
+        if (ph.getNextTurn().equals(ai) && !ph.getPhase().isBefore(PhaseType.END_OF_TURN)) {
+            return new AiAbilityDecision(100, AiPlayDecision.WillPlay);
+        }
+        if (isSorcerySpeed(sa, ai)) {
+            return new AiAbilityDecision(100, AiPlayDecision.WillPlay);
+        }
+        return new AiAbilityDecision(0, AiPlayDecision.TimingRestrictions);
     }
 
     /*
